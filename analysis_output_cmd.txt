@@ -1,0 +1,7 @@
+Analyzing dory_ukraine...                                       
+
+   info - Don't use 'BuildContext's across async gaps - lib\screens\home_screen.dart:55:65 - use_build_context_synchronously
+warning - The value of the field '_canvasSize' isn't used - lib\widgets\tasks\writing_modal.dart:23:16 - unused_field
+warning - The declaration '_onPanUpdate' isn't referenced - lib\widgets\tasks\writing_modal.dart:25:8 - unused_element
+warning - The declaration '_onPanEnd' isn't referenced - lib\widgets\tasks\writing_modal.dart:41:8 - unused_element
+
