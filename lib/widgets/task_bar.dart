@@ -49,6 +49,7 @@ class TaskBar extends StatelessWidget {
             onTap: () => showModalBottomSheet(
               context: context,
               isScrollControlled: true,
+              enableDrag: false,
               builder: (context) => WritingModal(letter: letter),
             ),
           ),

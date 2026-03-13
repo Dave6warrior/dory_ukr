@@ -1,10 +1,77 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:confetti/confetti.dart';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import '../../models/letter.dart';
 import '../../providers/alphabet_provider.dart';
+import '../../utils/letter_segments.dart';
 
+// ─── Segment tracking helper ────────────────────────────────────────────────
+class _SegmentTracker {
+  final List<Offset> points;
+  late final double totalLength;
+  late final List<double> _cumLengths;
+
+  _SegmentTracker(this.points) {
+    _cumLengths = [0.0];
+    for (int i = 1; i < points.length; i++) {
+      _cumLengths.add(_cumLengths.last + (points[i] - points[i - 1]).distance);
+    }
+    totalLength = _cumLengths.last;
+  }
+
+  (Offset, double, double) project(Offset point) {
+    double bestDist = double.infinity;
+    Offset bestPt = points.first;
+    double bestProgress = 0.0;
+
+    for (int i = 0; i < points.length - 1; i++) {
+      final a = points[i];
+      final b = points[i + 1];
+      final ab = b - a;
+      final segLen = ab.distance;
+      if (segLen == 0) continue;
+
+      double t = ((point.dx - a.dx) * ab.dx + (point.dy - a.dy) * ab.dy) /
+          (segLen * segLen);
+      t = t.clamp(0.0, 1.0);
+
+      final closest = a + ab * t;
+      final dist = (point - closest).distance;
+
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPt = closest;
+        bestProgress = (_cumLengths[i] + t * segLen) / totalLength;
+      }
+    }
+    return (bestPt, bestProgress, bestDist);
+  }
+
+  Path pathUpTo(double progress) {
+    final path = Path();
+    if (points.isEmpty) return path;
+    path.moveTo(points.first.dx, points.first.dy);
+    final target = progress * totalLength;
+
+    for (int i = 0; i < points.length - 1; i++) {
+      if (_cumLengths[i] >= target) break;
+      if (_cumLengths[i + 1] <= target) {
+        path.lineTo(points[i + 1].dx, points[i + 1].dy);
+      } else {
+        final segLen = _cumLengths[i + 1] - _cumLengths[i];
+        final t = (target - _cumLengths[i]) / segLen;
+        final end = Offset.lerp(points[i], points[i + 1], t)!;
+        path.lineTo(end.dx, end.dy);
+        break;
+      }
+    }
+    return path;
+  }
+}
+
+// ─── Main widget ────────────────────────────────────────────────────────────
 class WritingModal extends StatefulWidget {
   final Letter letter;
   const WritingModal({super.key, required this.letter});
@@ -15,248 +82,319 @@ class WritingModal extends StatefulWidget {
 
 class _WritingModalState extends State<WritingModal>
     with TickerProviderStateMixin {
-  // ─── Drawing state ───────────────────────────────────────────────────────
-  final List<Offset?> _points = [];
+  // ─── Segment state ──────────────────────────────────────────
+  late List<List<Offset>> _segmentsNorm;
+  int _activeIdx = 0;
+  double _activeProgress = 0.0;
+  double _furthestProgress = 0.0;
+  final Set<int> _completedSegs = {};
 
-  // ─── Hit-map state ────────────────────────────────────────────────────────
-  final int gridSize = 300;
-  List<bool>? _targetGrid;      // Přesné pixely písmene
-  List<bool>? _toleranceGrid;   // Zóna bezpečí pro děti (lehoučké vybočení)
-  final Set<int> _coveredTargetCells = {};
-  int _totalTargetCells = 0;
-  bool _isHitMapReady = false;
+  // ─── Touch state ────────────────────────────────────────────
+  Offset? _touchPos;
+  bool _isDrawing = false;
+  double _distanceTraveled = 0.0;
+  Offset? _lastMovePos;
 
-  // ─── Interaction state ────────────────────────────────────────────────────
-  bool _isFlashingError = false;
+  // ─── Sparkle trail ──────────────────────────────────────────
+  final List<Offset> _sparkleTrail = [];
+  static const int _maxTrail = 8;
+
+  // ─── UI flags ───────────────────────────────────────────────
+  bool _isError = false;
   bool _isSuccess = false;
-  double _viewSize = 0;
+  bool _isReady = false;
 
-  // ─── Animation controllers ────────────────────────────────────────────────
-  late AnimationController _shakeController;
-  late Animation<double> _shakeAnimation;
+  // ─── Layout cache ───────────────────────────────────────────
+  Rect _letterRect = Rect.zero;
+  Size _canvasSize = Size.zero;
 
-  late AnimationController _successController;
+  // ─── Ink bounds (normalised to TextPainter layout) ──────────
+  double _inkNL = 0, _inkNT = 0, _inkNR = 1, _inkNB = 1;
+
+  // ─── Animation controllers ─────────────────────────────────
+  late AnimationController _shakeCtrl;
+  late Animation<double> _shakeAnim;
+  late AnimationController _sparkleCtrl;
+  late AnimationController _successCtrl;
   late Animation<double> _successFade;
   late Animation<double> _successScale;
+  late ConfettiController _confettiCtrl;
 
-  late AnimationController _errorFlashController;
-  late Animation<Color?> _errorFlashColor;
+  // ─── Celebration ────────────────────────────────────────────
+  static const _phrases = [
+    'Молодець!', 'Чудово!', 'Супер!', 'Так тримати!',
+    'Гарна робота!', 'Браво!', 'Відмінно!', 'Чемпіон!',
+  ];
+  static const _sparkleColors = [
+    Color(0xFF0057B7), Color(0xFFFFD700), Color(0xFF2ECC71),
+    Color(0xFFE74C3C), Color(0xFF9B59B6), Color(0xFFF39C12),
+  ];
+  late String _phrase;
 
-  // ─── Lifecycle ────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
+    _segmentsNorm = LetterSegments.getSegments(widget.letter.character);
+    _phrase = _phrases[math.Random().nextInt(_phrases.length)];
 
-    // Zatřesení při chybě
-    _shakeController = AnimationController(
+    _shakeCtrl = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 500));
-    _shakeAnimation = Tween<double>(begin: 0, end: 10)
+    _shakeAnim = Tween<double>(begin: 0, end: 10)
         .chain(CurveTween(curve: Curves.elasticIn))
-        .animate(_shakeController);
+        .animate(_shakeCtrl);
 
-    // Animace úspěchu (Zelená + Zvuk/Overlay)
-    _successController = AnimationController(
+    _sparkleCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 1200))
+      ..repeat();
+
+    _successCtrl = AnimationController(
         vsync: this, duration: const Duration(milliseconds: 450));
-    _successFade =
-        Tween<double>(begin: 0, end: 1).animate(CurvedAnimation(
-      parent: _successController,
-      curve: Curves.easeOut,
-    ));
+    _successFade = Tween<double>(begin: 0, end: 1)
+        .animate(CurvedAnimation(parent: _successCtrl, curve: Curves.easeOut));
     _successScale = Tween<double>(begin: 0.6, end: 1.0).animate(
-        CurvedAnimation(parent: _successController, curve: Curves.elasticOut));
+        CurvedAnimation(parent: _successCtrl, curve: Curves.elasticOut));
 
-    // Červené probliknutí při chybě
-    _errorFlashController = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 400));
-    _errorFlashColor = ColorTween(begin: Colors.red, end: Colors.red[200])
-        .animate(_errorFlashController);
+    _confettiCtrl = ConfettiController(duration: const Duration(seconds: 2));
 
-    _initHitMap();
+    _computeInkBounds();
   }
 
   @override
   void dispose() {
-    _shakeController.dispose();
-    _successController.dispose();
-    _errorFlashController.dispose();
+    _shakeCtrl.dispose();
+    _sparkleCtrl.dispose();
+    _successCtrl.dispose();
+    _confettiCtrl.dispose();
     super.dispose();
   }
 
-  // ─── Generování Hit-Mapy ───────────────────────────────────────────────
-  Future<void> _initHitMap() async {
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(
-        recorder, Rect.fromLTWH(0, 0, gridSize.toDouble(), gridSize.toDouble()));
+  // ─── Compute real ink bounds via off-screen render ──────────
+  Future<void> _computeInkBounds() async {
+    const gs = 300;
+    final rec = ui.PictureRecorder();
+    final c = Canvas(rec, const Rect.fromLTWH(0, 0, gs * 1.0, gs * 1.0));
 
-    final textSpan = TextSpan(
+    final ts = TextSpan(
       text: widget.letter.character,
       style: const TextStyle(
-        fontSize: 250,
-        fontWeight: FontWeight.w900,
-        fontFamily: 'Nunito',
-        color: Colors.black,
-      ),
+          fontSize: 250,
+          fontWeight: FontWeight.w900,
+          fontFamily: 'Nunito',
+          color: Colors.black),
     );
-    final textPainter = TextPainter(
-        text: textSpan, textDirection: TextDirection.ltr)
+    final tp = TextPainter(text: ts, textDirection: TextDirection.ltr)
       ..layout();
-    final xCenter = (gridSize - textPainter.width) / 2;
-    final yCenter = (gridSize - textPainter.height) / 2;
-    textPainter.paint(canvas, Offset(xCenter, yCenter));
+    final ox = (gs - tp.width) / 2;
+    final oy = (gs - tp.height) / 2;
+    tp.paint(c, Offset(ox, oy));
 
-    final picture = recorder.endRecording();
-    final image = await picture.toImage(gridSize, gridSize);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (byteData == null) return;
+    final pic = rec.endRecording();
+    final img = await pic.toImage(gs, gs);
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null) return;
 
-    _targetGrid = List<bool>.filled(gridSize * gridSize, false);
-    _toleranceGrid = List<bool>.filled(gridSize * gridSize, false);
-    int targetCount = 0;
-
-    for (int y = 0; y < gridSize; y++) {
-      for (int x = 0; x < gridSize; x++) {
-        final int index = (y * gridSize + x) * 4;
-        final int alpha = byteData.getUint8(index + 3);
-        if (alpha > 128) {
-          _targetGrid![y * gridSize + x] = true;
-          targetCount++;
-        }
-      }
-    }
-    _totalTargetCells = targetCount;
-
-    // Rozšíření zóny tolerance pro děti (bezpečná zóna pro tah prstem)
-    const int minorRadius = 55; // Velkorysá zóna pro malé děti
-
-    for (int y = 0; y < gridSize; y++) {
-      for (int x = 0; x < gridSize; x++) {
-        if (!_targetGrid![y * gridSize + x]) continue;
-        for (int dy = -minorRadius; dy <= minorRadius; dy += 2) {
-          for (int dx = -minorRadius; dx <= minorRadius; dx += 2) {
-            final int distSq = dx * dx + dy * dy;
-            final int ny = y + dy;
-            final int nx = x + dx;
-            if (ny < 0 || ny >= gridSize || nx < 0 || nx >= gridSize) continue;
-            if (distSq <= minorRadius * minorRadius) {
-              _toleranceGrid![ny * gridSize + nx] = true;
-            }
-          }
+    int minX = gs, maxX = 0, minY = gs, maxY = 0;
+    for (int y = 0; y < gs; y++) {
+      for (int x = 0; x < gs; x++) {
+        if (bd.getUint8((y * gs + x) * 4 + 3) > 20) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
         }
       }
     }
 
-    if (mounted) {
-      setState(() => _isHitMapReady = true);
+    if (maxX <= minX || maxY <= minY) {
+      if (mounted) setState(() => _isReady = true);
+      return;
+    }
+
+    _inkNL = (minX - ox) / tp.width;
+    _inkNT = (minY - oy) / tp.height;
+    _inkNR = (maxX - ox) / tp.width;
+    _inkNB = (maxY - oy) / tp.height;
+
+    if (mounted) setState(() => _isReady = true);
+  }
+
+  // ─── Coordinate helpers ─────────────────────────────────────
+  void _computeLetterRect(Size canvasSize) {
+    final tp = TextPainter(
+      text: TextSpan(
+        text: widget.letter.character,
+        style: TextStyle(
+            fontSize: canvasSize.height * 0.83,
+            fontWeight: FontWeight.w900,
+            fontFamily: 'Nunito'),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final lx = (canvasSize.width - tp.width) / 2;
+    final ly = (canvasSize.height - tp.height) / 2;
+
+    // Map to actual ink bounds (not full ascent/descent)
+    _letterRect = Rect.fromLTRB(
+      lx + _inkNL * tp.width,
+      ly + _inkNT * tp.height,
+      lx + _inkNR * tp.width,
+      ly + _inkNB * tp.height,
+    );
+    _canvasSize = canvasSize;
+  }
+
+  List<Offset> _toCanvas(List<Offset> norm) => norm
+      .map((p) => Offset(
+            _letterRect.left + p.dx * _letterRect.width,
+            _letterRect.top + p.dy * _letterRect.height,
+          ))
+      .toList();
+
+  // ─── Pointer handlers ──────────────────────────────────────
+  void _onPointerDown(PointerDownEvent e) {
+    if (_isSuccess || _isError) return;
+    if (_activeIdx >= _segmentsNorm.length) return;
+
+    final pos = e.localPosition;
+    final seg = _toCanvas(_segmentsNorm[_activeIdx]);
+    final tolerance = _canvasSize.width * 0.30;
+
+    if ((pos - seg.first).distance <= tolerance) {
+      setState(() {
+        _isDrawing = true;
+        _touchPos = pos;
+        _activeProgress = 0.0;
+        _furthestProgress = 0.0;
+        _distanceTraveled = 0.0;
+        _lastMovePos = pos;
+        _sparkleTrail.clear();
+      });
     }
   }
 
-  // ─── Pomocné funkce souřadnic ─────────────────────────────────────────
-  (int gx, int gy) _toGrid(Offset screenPos) {
-    final double s = gridSize / _viewSize;
-    return ((screenPos.dx * s).toInt(), (screenPos.dy * s).toInt());
-  }
+  void _onPointerMove(PointerMoveEvent e) {
+    if (!_isDrawing || _isSuccess || _isError) return;
 
-  // ─── Herní akce ──────────────────────────────────────────────────────────
-  void _clear() {
+    final pos = e.localPosition;
+    final seg = _toCanvas(_segmentsNorm[_activeIdx]);
+    final tracker = _SegmentTracker(seg);
+    final (_, progress, dist) = tracker.project(pos);
+    final tolerance = _canvasSize.width * 0.30;
+
+    if (dist > tolerance) {
+      _triggerError();
+      return;
+    }
+
     setState(() {
-      _points.clear();
-      _coveredTargetCells.clear();
-      _isFlashingError = false;
-      _isSuccess = false;
+      _touchPos = pos;
+      if (_lastMovePos != null) {
+        _distanceTraveled += (pos - _lastMovePos!).distance;
+      }
+      _lastMovePos = pos;
+      if (progress > _furthestProgress) {
+        _furthestProgress = progress;
+        _activeProgress = progress;
+      }
+      _sparkleTrail.add(pos);
+      if (_sparkleTrail.length > _maxTrail) _sparkleTrail.removeAt(0);
     });
-    _successController.reset();
-    _errorFlashController.reset();
+
+    _checkSegmentDone();
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    if (!_isDrawing) return;
+    setState(() {
+      _isDrawing = false;
+      _touchPos = null;
+      _sparkleTrail.clear();
+    });
+    // Check on pointer up too (for taps on dots)
+    _checkSegmentDone();
+  }
+
+  // ─── Game actions ───────────────────────────────────────────
+  void _resetAll() {
+    setState(() {
+      _activeIdx = 0;
+      _activeProgress = 0.0;
+      _furthestProgress = 0.0;
+      _completedSegs.clear();
+      _isDrawing = false;
+      _isError = false;
+      _isSuccess = false;
+      _touchPos = null;
+      _sparkleTrail.clear();
+      _distanceTraveled = 0.0;
+      _lastMovePos = null;
+    });
+    _successCtrl.reset();
+    _confettiCtrl.stop();
   }
 
   void _triggerError() {
-    if (_isFlashingError || _isSuccess) return;
+    if (_isError || _isSuccess) return;
     setState(() {
-      _isFlashingError = true;
-      _points.add(null);
+      _isError = true;
+      _isDrawing = false;
+      _touchPos = null;
+      _sparkleTrail.clear();
     });
-    _shakeController.forward(from: 0.0);
-    _errorFlashController.repeat(reverse: true);
+    _shakeCtrl.forward(from: 0.0);
 
-    Future.delayed(const Duration(milliseconds: 600), () {
-      if (mounted) _clear();
+    Future.delayed(const Duration(milliseconds: 700), () {
+      if (mounted) {
+        setState(() {
+          _isError = false;
+          _activeIdx = 0;
+          _activeProgress = 0.0;
+          _furthestProgress = 0.0;
+          _completedSegs.clear();
+        });
+      }
     });
   }
 
-  void _checkSuccess() {
-    if (_isSuccess || _totalTargetCells == 0) return;
-    // Kontrola pokrytí písmene, 85% stačí k tomu, aby to vypadalo perfektně a dítě nebylo frustrované
-    final double coverage = _coveredTargetCells.length / _totalTargetCells;
-    if (coverage >= 0.85) {
+  void _checkSegmentDone() {
+    if (_activeIdx >= _segmentsNorm.length) return;
+    final seg = _toCanvas(_segmentsNorm[_activeIdx]);
+    final tracker = _SegmentTracker(seg);
+    // Short segments (dots): just progress check. Long: also need distance.
+    final isShort = tracker.totalLength < 40;
+    final minDist = tracker.totalLength * 0.55;
+    if (_activeProgress >= 0.85 &&
+        (isShort || _distanceTraveled >= minDist)) {
+      setState(() {
+        _completedSegs.add(_activeIdx);
+        _activeIdx++;
+        _activeProgress = 0.0;
+        _furthestProgress = 0.0;
+        _isDrawing = false;
+        _touchPos = null;
+        _sparkleTrail.clear();
+        _distanceTraveled = 0.0;
+        _lastMovePos = null;
+      });
+      _checkAllDone();
+    }
+  }
+
+  void _checkAllDone() {
+    if (_completedSegs.length == _segmentsNorm.length) {
       setState(() => _isSuccess = true);
-      _successController.forward();
+      _confettiCtrl.play();
+      _successCtrl.forward();
       Provider.of<AlphabetProvider>(context, listen: false)
           .completeWriting(widget.letter.id);
-      Future.delayed(const Duration(milliseconds: 1800), () {
+      Future.delayed(const Duration(milliseconds: 2500), () {
         if (mounted) Navigator.pop(context);
       });
     }
   }
 
-  // ─── Zpracování dotyků (Nyní v GestureDetectoru pro fixaci scrollování) ─
-  void _handlePointerDown(Offset localPos) {
-    if (_isSuccess || _isFlashingError) return;
-    final (gx, gy) = _toGrid(localPos);
-    if (gx < 0 || gx >= gridSize || gy < 0 || gy >= gridSize) {
-      _triggerError();
-      return;
-    }
-    final int idx = gy * gridSize + gx;
-    
-    // Začínáme novou čáru
-    _points.add(null);
-    
-    if (_targetGrid![idx] || _toleranceGrid![idx]) {
-      setState(() {
-        _points.add(localPos);
-        if (_targetGrid![idx]) _coveredTargetCells.add(idx);
-      });
-      _checkSuccess();
-    } else {
-      _triggerError();
-    }
-  }
-
-  void _handlePointerMove(Offset localPos) {
-    if (_isSuccess || _isFlashingError) return;
-    final (gx, gy) = _toGrid(localPos);
-
-    if (gx < 0 || gx >= gridSize || gy < 0 || gy >= gridSize) {
-      _triggerError();
-      return;
-    }
-
-    final int idx = gy * gridSize + gx;
-
-    if (_targetGrid![idx]) {
-      // Jsme přímo na písmenu - zaznamenáme bod a pokrytí
-      setState(() {
-        _points.add(localPos);
-        _coveredTargetCells.add(idx);
-      });
-      _checkSuccess();
-    } else if (_toleranceGrid![idx]) {
-      // Zóna benevolence (dítě trochu ujelo) - neznamená chybu!
-      // Pouze nepřidáváme pokrytí, bod zaznamenáme, aby linka byla nepřerušená
-      setState(() {
-        _points.add(localPos);
-      });
-    } else {
-      // Dítě hodně sjelo mimo tolerance - chyba a reset
-      _triggerError();
-    }
-  }
-
-  void _handlePointerUp() {
-    if (_isSuccess || _isFlashingError) return;
-    setState(() => _points.add(null));
-    _checkSuccess();
-  }
-
+  // ─── Build ──────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -266,261 +404,366 @@ class _WritingModalState extends State<WritingModal>
         color: Colors.white,
         borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
       ),
-      child: Column(
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Напиши літеру:',
-                  style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-              IconButton(
-                  icon: const Icon(Icons.refresh, size: 32),
-                  onPressed: _clear),
-            ],
-          ),
-          const SizedBox(height: 20),
-          Expanded(
-            child: !_isHitMapReady
-                ? const Center(child: CircularProgressIndicator())
-                : LayoutBuilder(builder: (context, constraints) {
-                    final double viewSize = math.min(
-                        constraints.maxWidth, constraints.maxHeight);
-                    _viewSize = viewSize;
+      child: Column(children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('Напиши літеру:',
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+            IconButton(
+                icon: const Icon(Icons.refresh, size: 32),
+                onPressed: _resetAll),
+          ],
+        ),
+        const SizedBox(height: 20),
+        Expanded(
+          child: !_isReady
+              ? const Center(child: CircularProgressIndicator())
+              : LayoutBuilder(builder: (context, constraints) {
+                  final viewSize = math.min(
+                      constraints.maxWidth, constraints.maxHeight);
+                  _computeLetterRect(Size(viewSize, viewSize));
 
-                    return Center(
-                      child: AnimatedBuilder(
-                        animation: _shakeAnimation,
-                        builder: (context, child) => Transform.translate(
-                          offset: Offset(
-                              _shakeAnimation.value *
-                                  math.sin(_shakeController.value *
-                                      math.pi * 4), 0),
-                          child: child,
-                        ),
-                        child: SizedBox(
-                          width: viewSize,
-                          height: viewSize,
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: Colors.grey[50],
-                              borderRadius: BorderRadius.circular(20),
-                              border:
-                                  Border.all(color: Colors.grey[300]!),
+                  return Center(
+                    child: AnimatedBuilder(
+                      animation: _shakeAnim,
+                      builder: (ctx, child) => Transform.translate(
+                        offset: Offset(
+                            _shakeAnim.value *
+                                math.sin(_shakeCtrl.value * math.pi * 4),
+                            0),
+                        child: child,
+                      ),
+                      child: SizedBox(
+                        width: viewSize,
+                        height: viewSize,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: Colors.grey[50],
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: Colors.grey[300]!),
+                          ),
+                          child: Stack(alignment: Alignment.center, children: [
+                            // ── Background letter ─────────
+                            CustomPaint(
+                              size: Size.infinite,
+                              painter: _LetterBgPainter(
+                                  character: widget.letter.character),
                             ),
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                // ── Podkladové slabé písmeno ──────────────
-                                CustomPaint(
-                                  size: Size.infinite,
-                                  painter: LetterBackgroundPainter(
-                                      character: widget.letter.character),
-                                ),
 
-                                // ── Vrstva kreslení (GestureDetector blokuje scrollování!) ─
-                                GestureDetector(
-                                  behavior: HitTestBehavior.opaque,
-                                  onPanStart: (e) => _handlePointerDown(e.localPosition),
-                                  onPanUpdate: (e) => _handlePointerMove(e.localPosition),
-                                  onPanEnd: (_) => _handlePointerUp(),
-                                  onPanCancel: () => _handlePointerUp(),
-                                  child: AnimatedBuilder(
-                                    animation: _errorFlashController,
-                                    builder: (context, child) {
-                                      return CustomPaint(
-                                        painter: DrawingPainter(
-                                          character: widget.letter.character,
-                                          points: _points,
-                                          isError: _isFlashingError,
-                                          isSuccess: _isSuccess,
-                                          errorColor: _isFlashingError
-                                              ? (_errorFlashColor.value ?? Colors.red)
-                                              : Colors.red,
-                                        ),
-                                        size: Size.infinite,
-                                      );
-                                    },
+                            // ── Drawing layer ─────────────
+                            Listener(
+                              behavior: HitTestBehavior.opaque,
+                              onPointerDown: _onPointerDown,
+                              onPointerMove: _onPointerMove,
+                              onPointerUp: _onPointerUp,
+                              child: AnimatedBuilder(
+                                animation: _sparkleCtrl,
+                                builder: (ctx, _) => CustomPaint(
+                                  painter: _TracingPainter(
+                                    character: widget.letter.character,
+                                    segments: _segmentsNorm
+                                        .map(_toCanvas)
+                                        .toList(),
+                                    completedSegs: _completedSegs,
+                                    activeIdx: _activeIdx,
+                                    activeProgress: _activeProgress,
+                                    isError: _isError,
+                                    touchPos: _touchPos,
+                                    sparkleRotation:
+                                        _sparkleCtrl.value * 2 * math.pi,
+                                    sparkleTrail: List.of(_sparkleTrail),
+                                    totalSegments: _segmentsNorm.length,
+                                    sparkleColors: _sparkleColors,
                                   ),
+                                  size: Size.infinite,
                                 ),
+                              ),
+                            ),
 
-                                // ── Oslava úspěchu (Nápis "Molodec") ───────
-                                if (_isSuccess)
-                                  FadeTransition(
-                                    opacity: _successFade,
-                                    child: ScaleTransition(
-                                      scale: _successScale,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                            horizontal: 24, vertical: 16),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF2ECC71)
-                                              .withValues(alpha: 0.92),
-                                          borderRadius:
-                                              BorderRadius.circular(20),
-                                          boxShadow: [
-                                            BoxShadow(
-                                              color: const Color(0xFF27AE60)
-                                                  .withValues(alpha: 0.5),
-                                              blurRadius: 20,
-                                              spreadRadius: 4,
-                                            ),
-                                          ],
+                            // ── Confetti ──────────────────
+                            Align(
+                              alignment: Alignment.topCenter,
+                              child: ConfettiWidget(
+                                confettiController: _confettiCtrl,
+                                blastDirectionality:
+                                    BlastDirectionality.explosive,
+                                shouldLoop: false,
+                                numberOfParticles: 30,
+                                gravity: 0.15,
+                                colors: const [
+                                  Color(0xFF0057B7), Color(0xFFFFD700),
+                                  Color(0xFF2ECC71), Color(0xFFE74C3C),
+                                  Color(0xFF9B59B6),
+                                ],
+                              ),
+                            ),
+
+                            // ── Success overlay ───────────
+                            if (_isSuccess)
+                              FadeTransition(
+                                opacity: _successFade,
+                                child: ScaleTransition(
+                                  scale: _successScale,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 24, vertical: 16),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF2ECC71)
+                                          .withValues(alpha: 0.92),
+                                      borderRadius: BorderRadius.circular(20),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: const Color(0xFF27AE60)
+                                              .withValues(alpha: 0.5),
+                                          blurRadius: 20, spreadRadius: 4,
                                         ),
-                                        child: const Column(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Text(
-                                              '🌟',
-                                              style: TextStyle(fontSize: 44),
-                                            ),
-                                            SizedBox(height: 4),
-                                            Text(
-                                              'Молодець!',
-                                              style: TextStyle(
+                                      ],
+                                    ),
+                                    child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const Text('🌟',
+                                              style: TextStyle(fontSize: 44)),
+                                          const SizedBox(height: 4),
+                                          Text(_phrase,
+                                              style: const TextStyle(
                                                 fontSize: 34,
                                                 fontWeight: FontWeight.w900,
                                                 fontFamily: 'Nunito',
                                                 color: Colors.white,
-                                                letterSpacing: 0.5,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
+                                              )),
+                                        ]),
                                   ),
-                              ],
-                            ),
-                          ),
+                                ),
+                              ),
+                          ]),
                         ),
+                      ),
+                    ),
+                  );
+                }),
+        ),
+        const SizedBox(height: 20),
+        // ── Progress dots ─────────────
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 300),
+          child: _isSuccess
+              ? const SizedBox.shrink()
+              : Row(
+                  key: const ValueKey('dots'),
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: List.generate(_segmentsNorm.length, (i) {
+                    Color c;
+                    if (_completedSegs.contains(i)) {
+                      c = const Color(0xFF27AE60);
+                    } else if (i == _activeIdx) {
+                      c = const Color(0xFF1565C0);
+                    } else {
+                      c = Colors.grey[300]!;
+                    }
+                    return Container(
+                      margin: const EdgeInsets.symmetric(horizontal: 6),
+                      width: 14, height: 14,
+                      decoration: BoxDecoration(
+                        color: c, shape: BoxShape.circle,
+                        border: i == _activeIdx
+                            ? Border.all(
+                                color: const Color(0xFF1565C0), width: 2)
+                            : null,
                       ),
                     );
                   }),
-          ),
-          const SizedBox(height: 20),
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 300),
-            child: _isSuccess
-                ? const SizedBox.shrink()
-                : const Text(
-                    'Проведи лінію по контуру!',
-                    key: ValueKey('hint'),
-                    style: TextStyle(color: Colors.grey, fontSize: 15),
-                  ),
-          ),
-          const SizedBox(height: 10),
-        ],
-      ),
+                ),
+        ),
+        const SizedBox(height: 6),
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 300),
+          child: _isSuccess
+              ? const SizedBox.shrink()
+              : Text(
+                  'Обведи частину ${_activeIdx + 1} з ${_segmentsNorm.length}',
+                  key: const ValueKey('hint'),
+                  style: const TextStyle(color: Colors.grey, fontSize: 14)),
+        ),
+        const SizedBox(height: 10),
+      ]),
     );
   }
 }
 
-// ─── DrawingPainter (Kreslíř Masky) ─────────────────────────────────────────
-
-class DrawingPainter extends CustomPainter {
+// ─── Tracing Painter ────────────────────────────────────────────────────────
+class _TracingPainter extends CustomPainter {
   final String character;
-  final List<Offset?> points;
+  final List<List<Offset>> segments;
+  final Set<int> completedSegs;
+  final int activeIdx;
+  final double activeProgress;
   final bool isError;
-  final bool isSuccess;
-  final Color errorColor;
+  final Offset? touchPos;
+  final double sparkleRotation;
+  final List<Offset> sparkleTrail;
+  final int totalSegments;
+  final List<Color> sparkleColors;
 
-  DrawingPainter({
+  _TracingPainter({
     required this.character,
-    required this.points,
-    this.isError = false,
-    this.isSuccess = false,
-    this.errorColor = Colors.red,
+    required this.segments,
+    required this.completedSegs,
+    required this.activeIdx,
+    required this.activeProgress,
+    required this.isError,
+    required this.touchPos,
+    required this.sparkleRotation,
+    required this.sparkleTrail,
+    required this.totalSegments,
+    required this.sparkleColors,
   });
 
+  void _paintLetter(Canvas canvas, Size size, Color color) {
+    final ts = TextSpan(
+      text: character,
+      style: TextStyle(
+          fontSize: size.height * 0.83,
+          fontWeight: FontWeight.w900,
+          fontFamily: 'Nunito',
+          color: color),
+    );
+    final tp = TextPainter(text: ts, textDirection: TextDirection.ltr)
+      ..layout();
+    tp.paint(canvas,
+        Offset((size.width - tp.width) / 2, (size.height - tp.height) / 2));
+  }
+
+  void _drawStroke(
+      Canvas canvas, List<Offset> seg, double progress, double w) {
+    if (seg.length < 2 || progress <= 0) return;
+    canvas.drawPath(
+      _SegmentTracker(seg).pathUpTo(progress),
+      Paint()
+        ..color = Colors.black
+        ..strokeWidth = w
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke,
+    );
+  }
+
+  /// Guide: semi-transparent letter tinted by segment stroke.
+  void _drawGuide(Canvas canvas, Size size, List<Offset> seg, double sw) {
+    canvas.saveLayer(Offset.zero & size, Paint());
+    _drawStroke(canvas, seg, 1.0, sw);
+    canvas.saveLayer(
+        Offset.zero & size, Paint()..blendMode = BlendMode.srcIn);
+    _paintLetter(canvas, size,
+        const Color(0xFF42A5F5).withValues(alpha: 0.28));
+    canvas.restore();
+    canvas.restore();
+
+    // Start circle
+    canvas.drawCircle(seg.first, 11,
+        Paint()..color = const Color(0xFF42A5F5).withValues(alpha: 0.45));
+    canvas.drawCircle(
+        seg.first, 11,
+        Paint()
+          ..color = const Color(0xFF1565C0)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5);
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
-    if (points.isEmpty) return;
+    final sw = size.width * 0.13;
 
-    // Vytvoříme si oddělenou vrstvu pro maskování
-    canvas.saveLayer(Offset.zero & size, Paint());
+    // 1. Completed segments → green
+    if (completedSegs.isNotEmpty) {
+      canvas.saveLayer(Offset.zero & size, Paint());
+      for (final i in completedSegs) {
+        _drawStroke(canvas, segments[i], 1.0, sw);
+      }
+      canvas.saveLayer(
+          Offset.zero & size, Paint()..blendMode = BlendMode.srcIn);
+      _paintLetter(canvas, size, const Color(0xFF27AE60));
+      canvas.restore();
+      canvas.restore();
+    }
 
-    // 1. Nakreslíme tah prstem (bude to fungovat jako odkrývací maska)
-    final maskPaint = Paint()
-      ..color = Colors.black // Barva tu není důležitá, jde o pixely
-      ..strokeWidth = size.width * 0.16 // Krásně silná čára pro děti
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round
-      ..style = PaintingStyle.stroke;
+    // 2. Active segment → blue or red
+    if (activeIdx < totalSegments && activeProgress > 0) {
+      final color = isError ? Colors.red : const Color(0xFF1565C0);
+      canvas.saveLayer(Offset.zero & size, Paint());
+      _drawStroke(canvas, segments[activeIdx], activeProgress, sw);
+      canvas.saveLayer(
+          Offset.zero & size, Paint()..blendMode = BlendMode.srcIn);
+      _paintLetter(canvas, size, color);
+      canvas.restore();
+      canvas.restore();
+    }
 
-    for (int i = 0; i < points.length - 1; i++) {
-      if (points[i] != null && points[i + 1] != null) {
-        canvas.drawLine(points[i]!, points[i + 1]!, maskPaint);
+    // 3. Guide for active segment
+    if (activeIdx < totalSegments && !isError) {
+      _drawGuide(canvas, size, segments[activeIdx], sw);
+    }
+
+    // 4. Colorful sparkle trail
+    for (int i = 0; i < sparkleTrail.length; i++) {
+      final t = (i + 1) / sparkleTrail.length;
+      final color = sparkleColors[i % sparkleColors.length];
+      canvas.drawCircle(
+        sparkleTrail[i],
+        3.5 + t * 2,
+        Paint()..color = color.withValues(alpha: t * 0.6),
+      );
+    }
+
+    // 5. Sparkle ring at touch point (colorful)
+    if (touchPos != null && !isError) {
+      const n = 6;
+      const r = 16.0;
+      for (int i = 0; i < n; i++) {
+        final a = sparkleRotation + (i * 2 * math.pi / n);
+        final dc = Offset(
+            touchPos!.dx + r * math.cos(a), touchPos!.dy + r * math.sin(a));
+        final color = sparkleColors[i % sparkleColors.length];
+        final paint = Paint()
+          ..shader = RadialGradient(
+            colors: [
+              Colors.white.withValues(alpha: 0.9),
+              color.withValues(alpha: 0.5),
+              Colors.transparent,
+            ],
+            stops: const [0.0, 0.5, 1.0],
+          ).createShader(Rect.fromCircle(center: dc, radius: 6));
+        canvas.drawCircle(dc, 6, paint);
       }
     }
-
-    // 2. Definujeme si barvu výsledného krásného písmene
-    Color textColor;
-    if (isError) {
-      textColor = errorColor;
-    } else if (isSuccess) {
-      textColor = const Color(0xFF27AE60); // Úspěch -> Zelená
-    } else {
-      textColor = const Color(0xFF1565C0); // Normální kreslení -> Modrá
-    }
-
-    // 3. Spojíme náš tah s dokonalým písmenem (BlendMode.srcIn = ukaž písmeno jen tam, kde je tah)
-    final blendPaint = Paint()..blendMode = BlendMode.srcIn;
-    canvas.saveLayer(Offset.zero & size, blendPaint);
-
-    final textSpan = TextSpan(
-      text: character,
-      style: TextStyle(
-        fontSize: size.height * 0.83,
-        fontWeight: FontWeight.w900,
-        fontFamily: 'Nunito',
-        color: textColor,
-      ),
-    );
-    final textPainter = TextPainter(
-        text: textSpan, textDirection: TextDirection.ltr)
-      ..layout();
-    
-    final xCenter = (size.width - textPainter.width) / 2;
-    final yCenter = (size.height - textPainter.height) / 2;
-    
-    textPainter.paint(canvas, Offset(xCenter, yCenter));
-
-    // Zavřeme vrstvy maskování
-    canvas.restore();
-    canvas.restore();
   }
 
   @override
-  bool shouldRepaint(DrawingPainter oldDelegate) => true;
+  bool shouldRepaint(_TracingPainter old) => true;
 }
 
-// ─── LetterBackgroundPainter ─────────────────────────────────────────────────
-
-class LetterBackgroundPainter extends CustomPainter {
+// ─── Background letter painter ──────────────────────────────────────────────
+class _LetterBgPainter extends CustomPainter {
   final String character;
-
-  LetterBackgroundPainter({required this.character});
+  _LetterBgPainter({required this.character});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final textSpan = TextSpan(
+    final ts = TextSpan(
       text: character,
       style: TextStyle(
-        fontSize: size.height * 0.83,
-        fontWeight: FontWeight.w900,
-        fontFamily: 'Nunito',
-        color: Colors.grey.withValues(alpha: 0.22), // Slabě šedé pozadí
-      ),
+          fontSize: size.height * 0.83,
+          fontWeight: FontWeight.w900,
+          fontFamily: 'Nunito',
+          color: Colors.grey.withValues(alpha: 0.22)),
     );
-    final textPainter = TextPainter(
-        text: textSpan, textDirection: TextDirection.ltr)
+    final tp = TextPainter(text: ts, textDirection: TextDirection.ltr)
       ..layout();
-    final xCenter = (size.width - textPainter.width) / 2;
-    final yCenter = (size.height - textPainter.height) / 2;
-    textPainter.paint(canvas, Offset(xCenter, yCenter));
+    tp.paint(canvas,
+        Offset((size.width - tp.width) / 2, (size.height - tp.height) / 2));
   }
 
   @override
-  bool shouldRepaint(LetterBackgroundPainter old) =>
-      old.character != character;
+  bool shouldRepaint(_LetterBgPainter old) => old.character != character;
 }
